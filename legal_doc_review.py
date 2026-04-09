@@ -18,6 +18,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env file automatically
+
 import anthropic
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn

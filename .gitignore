@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 review_output.docx
 test_*.docx
+.env
