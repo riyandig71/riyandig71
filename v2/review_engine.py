@@ -143,85 +143,77 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
-    # --- Strategy 2: find the LARGEST complete [ ... ] pair ---
-    candidates: list[str] = []
-    i = 0
-    while i < len(cleaned):
-        if cleaned[i] == "[":
-            depth = 0
-            start = i
-            for j in range(i, len(cleaned)):
-                if cleaned[j] == "[":
-                    depth += 1
-                elif cleaned[j] == "]":
-                    depth -= 1
-                    if depth == 0:
-                        candidates.append(cleaned[start:j + 1])
-                        i = j + 1
-                        break
-            else:
-                break  # unclosed — go to repair
-            continue
-        i += 1
-
-    for candidate in sorted(candidates, key=len, reverse=True):
-        try:
-            result = json.loads(candidate)
-            if isinstance(result, list):
-                return result
-        except json.JSONDecodeError:
-            continue
-
-    # --- Strategy 3: repair truncated JSON ---
+    # --- Strategy 2: extract complete JSON objects, string-aware ---
+    # This properly handles [ ] and { } inside string values like
+    # "See Article [5] of the Act" which broke naive bracket counting.
     start = cleaned.find("[")
     if start >= 0:
-        fragment = cleaned[start:]
+        fragment = cleaned[start + 1:]  # skip the opening [
 
-        # Approach A: slice at each "}" from end until we get valid JSON
-        last_brace = fragment.rfind("}")
-        if last_brace > 0:
-            search_from = last_brace
-            for _ in range(80):
-                candidate = fragment[:search_from + 1]
-                open_brackets = candidate.count("[") - candidate.count("]")
-                repair = candidate.rstrip().rstrip(",")
-                repair += "]" * max(open_brackets, 0)
-                try:
-                    result = json.loads(repair)
-                    if isinstance(result, list) and len(result) > 0:
+        objects: list[str] = []
+        depth = 0
+        in_string = False
+        escape_next = False
+        obj_start: int | None = None
+
+        for i, ch in enumerate(fragment):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            # Outside strings:
+            if ch == "{":
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    objects.append(fragment[obj_start:i + 1])
+                    obj_start = None
+            elif ch == "]" and depth == 0:
+                break  # end of array
+
+        if objects:
+            array_str = "[" + ",".join(objects) + "]"
+            try:
+                result = json.loads(array_str)
+                if isinstance(result, list) and len(result) > 0:
+                    if depth > 0 or obj_start is not None:
                         logger.warning(
-                            "Truncated JSON repaired (slice-at-brace). Got %d entries.",
+                            "Truncated JSON recovered (%d complete entries, "
+                            "last entry was incomplete and dropped).",
                             len(result),
                         )
-                        return result
-                except json.JSONDecodeError:
-                    pass
-                search_from = fragment.rfind("}", 0, search_from)
-                if search_from <= 0:
-                    break
-
-        # Approach B: close open quotes + braces + brackets
-        for trim in [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]:
-            trimmed = fragment[:len(fragment) - trim] if trim else fragment
-            # Close any unclosed string literal
-            quote_count = len(re.findall(r'(?<!\\)"', trimmed))
-            if quote_count % 2 == 1:
-                trimmed += '"'
-            trimmed = trimmed.rstrip().rstrip(",")
-            open_braces = trimmed.count("{") - trimmed.count("}")
-            open_brackets = trimmed.count("[") - trimmed.count("]")
-            repair = trimmed
-            repair += "}" * max(open_braces, 0) + "]" * max(open_brackets, 0)
-            try:
-                result = json.loads(repair)
-                if isinstance(result, list) and len(result) > 0:
-                    logger.warning(
-                        "Truncated JSON repaired (brute-force, trim=%d). Got %d entries.",
-                        trim, len(result),
-                    )
                     return result
             except json.JSONDecodeError:
-                continue
+                # If reassembly fails, try each object individually
+                valid_objects: list[str] = []
+                for obj in objects:
+                    try:
+                        json.loads(obj)
+                        valid_objects.append(obj)
+                    except json.JSONDecodeError:
+                        continue
+                if valid_objects:
+                    array_str = "[" + ",".join(valid_objects) + "]"
+                    try:
+                        result = json.loads(array_str)
+                        if isinstance(result, list):
+                            logger.warning(
+                                "Truncated JSON recovered (%d/%d objects valid).",
+                                len(valid_objects), len(objects),
+                            )
+                            return result
+                    except json.JSONDecodeError:
+                        pass
 
     logger.error("Failed to extract JSON from response (len=%d). "
                  "First 500 chars: %s", len(raw), raw[:500])
