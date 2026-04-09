@@ -130,51 +130,16 @@ def build_mock_agent2_validation(agent1_decisions):
     return validated
 
 
+# Module-level cache: store actual paragraph data so mock doesn't need to regex-parse
+_mock_para_cache: dict[str, tuple[list[dict], list[dict]]] = {}
+
+
 def mock_call_claude(client, *, system, user_message, model=None, max_tokens=4096):
     """Mock Claude API with structured JSON responses."""
-    # Parse the paragraph data from the user message
     if "Agent-1-legal-reviewer" in system:
-        # Extract paragraph pairs from the message and build decisions
-        # For simplicity, return a pre-built JSON based on content analysis
         logger.info("  [MOCK] Agent 1 called (model=%s)", model)
-
-        # Parse paragraphs from message
-        import re
-        para_blocks = re.findall(
-            r'Document A \[para_idx=(\d+)\]:\s*(.*?)(?=\nDocument B|\n---|\Z)',
-            user_message, re.DOTALL
-        )
-        b_blocks = re.findall(
-            r'Document B counterpart:\s*(.*?)(?=\nSentences|\n---|\Z)',
-            user_message, re.DOTALL
-        )
-        sent_blocks = re.findall(
-            r'Sentences in Document A:\s*(.*?)(?=\n---|$)',
-            user_message, re.DOTALL
-        )
-
-        # Build structured paragraph data
-        doc_a_paras = []
-        doc_b_paras = []
-
-        for i, (pidx, a_text) in enumerate(para_blocks):
-            sents = []
-            if i < len(sent_blocks):
-                for m in re.finditer(r'\[(\d+)\]\s*(.*)', sent_blocks[i]):
-                    sents.append({"idx": int(m.group(1)), "text": m.group(2).strip()})
-
-            doc_a_paras.append({
-                "para_idx": int(pidx),
-                "text": a_text.strip(),
-                "sentences": sents,
-            })
-
-            b_text = b_blocks[i].strip() if i < len(b_blocks) else ""
-            doc_b_paras.append({
-                "para_idx": int(pidx),
-                "text": b_text,
-            })
-
+        # Use cached paragraph data (set by main before calling agents)
+        doc_a_paras, doc_b_paras = _mock_para_cache.get("paras", ([], []))
         decisions = build_mock_agent1_decisions(doc_a_paras, doc_b_paras)
         return json.dumps(decisions, indent=2)
 
@@ -245,6 +210,8 @@ def main():
             all_b_dicts.append(_empty_para_dict(a_idx))
 
     # Step 6: Run Agent 1 + Agent 2 (mocked)
+    # Populate cache so mock uses actual document data, not regex-parsed message text
+    _mock_para_cache["paras"] = (all_a_dicts, all_b_dicts)
     mock_client = MagicMock()
 
     with patch("v2.review_engine.call_claude", side_effect=mock_call_claude):

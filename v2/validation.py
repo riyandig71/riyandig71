@@ -118,6 +118,16 @@ def check_completeness(
 # Check 4: REPLACE sanity
 # ---------------------------------------------------------------------------
 
+# Prompt/metadata fragments that must never appear in revised text
+_METADATA_PATTERNS = [
+    "Sentences in Document A",
+    "Document A [para_idx=",
+    "Document B counterpart",
+    "--- Paragraph",
+    "--- Agent 1",
+]
+
+
 def check_replace_sanity(decisions: list[ReviewDecision]) -> list[str]:
     """Detect suspicious REPLACE decisions."""
     issues: list[str] = []
@@ -131,6 +141,14 @@ def check_replace_sanity(decisions: list[ReviewDecision]) -> list[str]:
                 issues.append(
                     f"para_idx={d.para_idx}: REPLACE but text is identical (should be KEEP)"
                 )
+            # Check for prompt metadata leaking into revised text
+            for pattern in _METADATA_PATTERNS:
+                if pattern in d.revised:
+                    issues.append(
+                        f"para_idx={d.para_idx}: REPLACE contains prompt metadata "
+                        f"({pattern!r}) — must be stripped"
+                    )
+                    break
     return issues
 
 
@@ -150,6 +168,18 @@ def auto_fix_decisions(decisions: list[ReviewDecision]) -> list[ReviewDecision]:
 
     for i, d in enumerate(decisions):
         key = (d.para_idx, d.sent_idx)
+
+        # Fix metadata contamination — strip prompt artifacts from revised text
+        if d.action == Action.REPLACE and d.revised:
+            for pattern in _METADATA_PATTERNS:
+                if pattern in d.revised:
+                    # Revised text is garbage from prompt — revert to KEEP
+                    logger.info("Auto-fixed metadata contamination in para_idx=%d: %r",
+                                d.para_idx, pattern)
+                    d.action = Action.KEEP
+                    d.revised = ""
+                    d.reason = "(auto-fixed: prompt metadata detected in revised text)"
+                    break
 
         # Fix append corruption
         if d.action == Action.REPLACE and d.original and d.revised:
