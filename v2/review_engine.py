@@ -72,7 +72,7 @@ def call_claude(
     system: str,
     user_message: str,
     model: str = MODEL_STRONG,
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     max_retries: int = 5,
 ) -> str:
     """Send a request to the Claude API with retry on rate-limit errors.
@@ -179,32 +179,65 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
 
-    # Strategy 4: truncated JSON — model hit max_tokens
-    # Find last [ and try adding ] to close it
+    # Strategy 4: truncated JSON — model hit max_tokens mid-output
+    # The response may be cut inside a string value, so we need to:
+    #   a) find the last complete JSON object (ends with })
+    #   b) close any open strings, braces, brackets
     start = text.find("[")
     if start >= 0:
         fragment = text[start:]
-        # Try progressively trimming from the end and closing
-        for trim in [0, 1, 2, 5, 10, 50, 100]:
-            trimmed = fragment[:len(fragment) - trim] if trim else fragment
-            # Count unclosed brackets
-            open_brackets = trimmed.count("[") - trimmed.count("]")
-            open_braces = trimmed.count("{") - trimmed.count("}")
-            if open_brackets > 0 or open_braces > 0:
-                # Remove trailing comma if present
-                repair = trimmed.rstrip().rstrip(",")
-                repair += "}" * max(open_braces, 0) + "]" * max(open_brackets, 0)
+
+        # Approach A: find the last complete "}" and slice there
+        last_brace = fragment.rfind("}")
+        if last_brace > 0:
+            # Try slicing at each "}" from the end, looking for a valid array
+            search_from = last_brace
+            for _ in range(50):  # try up to 50 positions
+                candidate = fragment[:search_from + 1]
+                # Close any remaining open brackets
+                open_brackets = candidate.count("[") - candidate.count("]")
+                repair = candidate.rstrip().rstrip(",")
+                repair += "]" * max(open_brackets, 0)
                 try:
                     result = json.loads(repair)
-                    if isinstance(result, list):
+                    if isinstance(result, list) and len(result) > 0:
                         logger.warning(
-                            "JSON was truncated — repaired by closing %d brackets. "
+                            "JSON was truncated — repaired by slicing at last complete object. "
                             "Got %d entries (some may be missing).",
-                            open_brackets + open_braces, len(result),
+                            len(result),
                         )
                         return result
                 except json.JSONDecodeError:
-                    continue
+                    pass
+                # Move to previous "}"
+                search_from = fragment.rfind("}", 0, search_from)
+                if search_from <= 0:
+                    break
+
+        # Approach B: brute-force close everything (original strategy)
+        for trim in [0, 1, 2, 5, 10, 50, 100, 200, 500]:
+            trimmed = fragment[:len(fragment) - trim] if trim else fragment
+            # Close any open string (add a quote if odd number of unescaped quotes)
+            quote_count = len(re.findall(r'(?<!\\)"', trimmed))
+            if quote_count % 2 == 1:
+                trimmed += '"'
+            # Remove trailing junk after closing the string
+            trimmed = trimmed.rstrip().rstrip(",")
+            open_brackets = trimmed.count("[") - trimmed.count("]")
+            open_braces = trimmed.count("{") - trimmed.count("}")
+            repair = trimmed
+            repair += "}" * max(open_braces, 0) + "]" * max(open_brackets, 0)
+            try:
+                result = json.loads(repair)
+                if isinstance(result, list) and len(result) > 0:
+                    logger.warning(
+                        "JSON was truncated — brute-force repaired. "
+                        "Got %d entries (some may be missing).",
+                        len(result),
+                    )
+                    return result
+            except json.JSONDecodeError:
+                continue
 
     logger.error("Failed to extract JSON array from response (len=%d). "
                  "First 500 chars: %s", len(text), text[:500])
