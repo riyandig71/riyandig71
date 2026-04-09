@@ -94,18 +94,20 @@ def call_claude(
                 messages=[{"role": "user", "content": user_message}],
             )
             return resp.content[0].text
-        except anthropic.RateLimitError as exc:
+        except anthropic.RateLimitError:
             if attempt == max_retries:
                 raise
-            wait = 2 ** attempt  # 2, 4, 8, 16, 32 seconds
+            wait = 2 ** attempt
             logger.warning("Rate limited (attempt %d/%d). Waiting %ds...",
                            attempt, max_retries, wait)
             _time.sleep(wait)
-        except anthropic.APIStatusError as exc:
-            if exc.status_code >= 500 and attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning("Server error %d (attempt %d/%d). Waiting %ds...",
-                               exc.status_code, attempt, max_retries, wait)
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+            status = getattr(exc, "status_code", 0)
+            is_retryable = status >= 500 or status == 529 or isinstance(exc, anthropic.APIConnectionError)
+            if is_retryable and attempt < max_retries:
+                wait = min(2 ** attempt, 60)  # cap at 60s
+                logger.warning("Error %s (attempt %d/%d). Waiting %ds...",
+                               status or type(exc).__name__, attempt, max_retries, wait)
                 _time.sleep(wait)
             else:
                 raise
