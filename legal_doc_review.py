@@ -118,7 +118,9 @@ EDITING DISCIPLINE:
 - If benchmark B does not justify a change, preserve Document A.
 
 OUTPUT:
-1. A revised version of the Document A text for the assigned page(s) only, clearly indicating what was changed.
+1. A marked-up DOCX revision of Document A for the assigned page(s) only.
+   - Use markup / tracked revision style.
+   - Reviewer label: Agent-1-legal-reviewer
 
 2. A sentence ledger JSON containing every sentence ID:
 [
@@ -178,7 +180,10 @@ REVISION RULES:
 - No sentence may be skipped.
 
 OUTPUT:
-1. Final revised text for the assigned page(s) only, with clear indication of changes.
+1. Final marked-up DOCX for the assigned page(s) only.
+   - Must remain human-reviewable.
+   - Must preserve markup / tracked revision style.
+   - Reviewer label: Agent-2-legal-reviewer
 
 2. Validation log JSON:
 [
@@ -608,6 +613,31 @@ def _add_tracked_insertion(paragraph, run_index: int, new_text: str, author: str
         p_elem.append(ins_elem)
 
 
+def _ensure_comments_part(doc: DocxDocument) -> etree._Element:
+    """Return the <w:comments> root element, creating the comments part if needed."""
+    COMMENTS_URI = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+    for rel in doc.part.rels.values():
+        if rel.reltype == COMMENTS_URI:
+            return rel.target_part._element
+    # Create a new comments part
+    from docx.opc.part import Part
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    comments_xml = (
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+    )
+    comments_element = etree.fromstring(comments_xml.encode("utf-8"))
+    comments_part = Part(
+        partname="/word/comments.xml",
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        blob=etree.tostring(comments_element, xml_declaration=True, encoding="UTF-8"),
+        package=doc.part.package,
+    )
+    comments_part._element = comments_element
+    doc.part.relate_to(comments_part, COMMENTS_URI)
+    return comments_element
+
+
 def _add_comment_to_paragraph(
     paragraph,
     comment_text: str,
@@ -616,19 +646,30 @@ def _add_comment_to_paragraph(
 ) -> None:
     """Add a Word comment annotation to the paragraph.
 
-    This creates the minimal XML scaffolding for a <w:comment> visible in
-    Word's review pane.
+    Creates the full XML scaffolding: a <w:comment> in the comments part,
+    plus commentRangeStart/End and commentReference in the paragraph, so the
+    comment is visible in Word's review pane.
     """
-    # Ensure comments part exists
-    comments_part = None
-    for rel in doc.part.rels.values():
-        if "comments" in rel.reltype:
-            comments_part = rel.target_part
-            break
-
+    comments_root = _ensure_comments_part(doc)
     comment_id = str(_next_rev_id())
 
-    # Add comment range start + end markers in the paragraph
+    # --- 1. Create <w:comment> in the comments part ---
+    comment_elem = OxmlElement("w:comment")
+    comment_elem.set(qn("w:id"), comment_id)
+    comment_elem.set(qn("w:author"), author)
+    comment_elem.set(qn("w:date"), "2026-04-09T00:00:00Z")
+    comment_elem.set(qn("w:initials"), author[:3])
+    # Comment body paragraph
+    cp = OxmlElement("w:p")
+    cr = OxmlElement("w:r")
+    ct = OxmlElement("w:t")
+    ct.text = comment_text
+    cr.append(ct)
+    cp.append(cr)
+    comment_elem.append(cp)
+    comments_root.append(comment_elem)
+
+    # --- 2. Add comment range markers in the document paragraph ---
     range_start = OxmlElement("w:commentRangeStart")
     range_start.set(qn("w:id"), comment_id)
     paragraph._element.insert(0, range_start)
@@ -637,7 +678,7 @@ def _add_comment_to_paragraph(
     range_end.set(qn("w:id"), comment_id)
     paragraph._element.append(range_end)
 
-    # Add comment reference run
+    # --- 3. Add comment reference run ---
     ref_run = OxmlElement("w:r")
     ref_rpr = OxmlElement("w:rPr")
     ref_style = OxmlElement("w:rStyle")
@@ -679,23 +720,92 @@ def _diff_sentences(original: str, revised: str) -> list[tuple[str, str, str]]:
 # DOCX markup builder
 # ---------------------------------------------------------------------------
 
+def _enable_track_changes_view(doc: DocxDocument) -> None:
+    """Set document settings so Word opens with tracked changes visible."""
+    settings = doc.settings.element
+    # Remove existing trackChanges if present
+    for existing in settings.findall(qn("w:trackChanges")):
+        settings.remove(existing)
+    tc = OxmlElement("w:trackChanges")
+    settings.append(tc)
+    # Ensure revision view shows markup
+    for existing in settings.findall(qn("w:revisionView")):
+        settings.remove(existing)
+    rv = OxmlElement("w:revisionView")
+    rv.set(qn("w:markup"), "1")
+    rv.set(qn("w:comments"), "1")
+    rv.set(qn("w:insDel"), "1")
+    rv.set(qn("w:formatting"), "1")
+    settings.append(rv)
+
+
+def _apply_diff_to_paragraph(paragraph, old_text: str, new_text: str, diff_type: str, author: str) -> None:
+    """Apply a single diff operation to the appropriate paragraph."""
+    if diff_type == "replace":
+        # Try to find the old text in an existing run
+        for run_idx, run in enumerate(paragraph.runs):
+            if old_text.strip() and old_text.strip() in run.text:
+                _add_tracked_deletion(paragraph, run_idx, old_text, author)
+                _add_tracked_insertion(paragraph, run_idx, new_text, author)
+                run.text = run.text.replace(old_text.strip(), "")
+                return
+        # Could not locate in runs — append tracked change at end
+        _add_tracked_deletion(paragraph, len(paragraph.runs), old_text, author)
+        _add_tracked_insertion(paragraph, len(paragraph.runs), new_text, author)
+    elif diff_type == "insert":
+        _add_tracked_insertion(paragraph, len(paragraph.runs), new_text, author)
+    elif diff_type == "delete":
+        for run_idx, run in enumerate(paragraph.runs):
+            if old_text.strip() and old_text.strip() in run.text:
+                _add_tracked_deletion(paragraph, run_idx, old_text, author)
+                run.text = run.text.replace(old_text.strip(), "")
+                return
+        _add_tracked_deletion(paragraph, len(paragraph.runs), old_text, author)
+
+
+def _find_best_paragraph(page_paras: list[Any], sentence_text: str) -> Any:
+    """Find the paragraph that contains (or best matches) the given sentence text."""
+    if not sentence_text.strip():
+        return page_paras[0] if page_paras else None
+    # Exact containment
+    for para in page_paras:
+        if sentence_text.strip() in para.text:
+            return para
+    # Partial match — pick paragraph with highest overlap
+    best_para = page_paras[0]
+    best_score = 0
+    needle_words = set(sentence_text.lower().split())
+    for para in page_paras:
+        para_words = set(para.text.lower().split())
+        overlap = len(needle_words & para_words)
+        if overlap > best_score:
+            best_score = overlap
+            best_para = para
+    return best_para
+
+
 def build_tracked_changes_docx(
     source_docx_path: str | Path,
     page_results: list[PageResult],
     output_path: str | Path,
 ) -> Path:
-    """Create a DOCX with tracked revisions applied to Document A.
+    """Create a DOCX with native tracked revisions applied to Document A.
 
     For each page in *page_results* that has revisions, this function:
     1. Locates the original paragraphs on that page.
     2. Diffs the original text against the final revised text.
     3. Inserts ``<w:del>`` / ``<w:ins>`` XML elements so the file opens
        with visible tracked changes in Microsoft Word.
+    4. Adds ``<w:comment>`` elements for Agent-2 corrections.
+    5. Enables track-changes view in document settings.
 
     Pages not included in *page_results* are left untouched.
     """
     doc = DocxDocument(str(source_docx_path))
     pages = _split_docx_into_pages(doc)
+
+    # Enable tracked changes view so Word opens in review mode
+    _enable_track_changes_view(doc)
 
     result_by_page: dict[int, PageResult] = {
         pr.page_number: pr for pr in page_results if pr.success
@@ -707,6 +817,9 @@ def build_tracked_changes_docx(
             continue
 
         page_paras = pages[page_idx]
+        if not page_paras:
+            continue
+
         original_text = "\n".join(p.text for p in page_paras)
         final_text = pr.agent2_final_text or pr.agent1_revised_text
 
@@ -718,47 +831,30 @@ def build_tracked_changes_docx(
         # Determine the author label based on which agent made changes
         author = _AUTHOR_AGENT2 if pr.agent2_final_text else _AUTHOR_AGENT1
 
-        # Apply diffs at the paragraph level
-        # Strategy: work through the first paragraph of the page and apply
-        # tracked changes for each diff item.
-        if not page_paras:
-            continue
-
-        # Rebuild the first paragraph with tracked changes
-        target_para = page_paras[0]
-
+        # Apply diffs — route each change to the paragraph that contains it
         for diff_type, old, new in diffs:
             if diff_type == "equal":
                 continue
-            elif diff_type == "replace":
-                # Find the old text in the paragraph runs and mark it
-                for run_idx, run in enumerate(target_para.runs):
-                    if old.strip() and old.strip() in run.text:
-                        _add_tracked_deletion(target_para, run_idx, old, author)
-                        _add_tracked_insertion(target_para, run_idx, new, author)
-                        run.text = run.text.replace(old.strip(), "")
-                        break
-                else:
-                    # Could not locate in runs — append at end
-                    _add_tracked_deletion(target_para, len(target_para.runs), old, author)
-                    _add_tracked_insertion(target_para, len(target_para.runs), new, author)
-            elif diff_type == "insert":
-                _add_tracked_insertion(target_para, len(target_para.runs), new, author)
-            elif diff_type == "delete":
-                for run_idx, run in enumerate(target_para.runs):
-                    if old.strip() and old.strip() in run.text:
-                        _add_tracked_deletion(target_para, run_idx, old, author)
-                        run.text = run.text.replace(old.strip(), "")
-                        break
-                else:
-                    _add_tracked_deletion(target_para, len(target_para.runs), old, author)
+            # Find the best matching paragraph for this sentence
+            search_text = old if old else new
+            target_para = _find_best_paragraph(page_paras, search_text)
+            _apply_diff_to_paragraph(target_para, old, new, diff_type, author)
 
-        # Add comments from validation log
+        # Add comments from validation log where Agent 2 corrected Agent 1
         for v_entry in pr.agent2_validation_log:
             if v_entry.get("validation") in ("corrected", "missing_fixed"):
                 notes = v_entry.get("notes", "")
                 if notes:
-                    _add_comment_to_paragraph(target_para, notes, _AUTHOR_AGENT2, doc)
+                    # Route comment to the paragraph containing the sentence
+                    sid = v_entry.get("sentence_id", "")
+                    # Find sentence original text from Agent 1 ledger
+                    sent_text = ""
+                    for le in pr.agent1_ledger:
+                        if le.get("sentence_id") == sid:
+                            sent_text = le.get("original_text", "")
+                            break
+                    comment_para = _find_best_paragraph(page_paras, sent_text) if sent_text else page_paras[0]
+                    _add_comment_to_paragraph(comment_para, notes, _AUTHOR_AGENT2, doc)
 
     out = Path(output_path)
     doc.save(str(out))
