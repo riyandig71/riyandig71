@@ -308,26 +308,31 @@ class Orchestrator:
                     "error": str(exc),
                 })
 
-        # Token estimate
-        prompt_overhead = 2000
+        # Token estimate — calibrated against CLOD 418 actual cost
+        # Legal text: ~3.5 chars per token, ~130 output tokens per sentence
+        prompt_overhead = 2500
         chars_b = sum(len(p.text) for p in doc_b.paragraphs)
+        total_a_chars = est.total_words * 5
+        total_batches = (est.total_paragraphs_a // 30) + 1
 
-        # Per part: system + doc_a_part + doc_b context
-        # Agent 1 sees mapped paragraphs; Agent 2 sees same + Agent 1 output
-        total_a_chars = est.total_words * 5  # rough chars from words
-        a1_input = (prompt_overhead + (total_a_chars + chars_b) // 4) * est.total_parts
-        a1_output = est.total_sentences * 50
-        a2_input = a1_input + a1_output
-        a2_output = a1_output
+        a1_input = prompt_overhead * total_batches + (total_a_chars + chars_b) // 3
+        a1_output = est.total_sentences * 130
+        a2_input = prompt_overhead * total_batches + (total_a_chars + chars_b) // 3 + a1_output
+        a2_output = est.total_sentences * 130
 
-        est.estimated_input_tokens = a1_input + a2_input
-        est.estimated_output_tokens = a1_output + a2_output
+        # 20% overhead for retries (529 errors, truncated responses)
+        retry_multiplier = 1.20
+
+        est.estimated_input_tokens = int((a1_input + a2_input) * retry_multiplier)
+        est.estimated_output_tokens = int((a1_output + a2_output) * retry_multiplier)
 
         a1p = PRICING.get(self.agent1_model, PRICING[MODEL_STRONG])
         a2p = PRICING.get(self.agent2_model, PRICING[MODEL_STRONG])
 
-        est.agent1_cost_usd = (a1_input / 1e6) * a1p["input"] + (a1_output / 1e6) * a1p["output"]
-        est.agent2_cost_usd = (a2_input / 1e6) * a2p["input"] + (a2_output / 1e6) * a2p["output"]
+        est.agent1_cost_usd = (a1_input * retry_multiplier / 1e6) * a1p["input"] + \
+                              (a1_output * retry_multiplier / 1e6) * a1p["output"]
+        est.agent2_cost_usd = (a2_input * retry_multiplier / 1e6) * a2p["input"] + \
+                              (a2_output * retry_multiplier / 1e6) * a2p["output"]
         est.total_cost_usd = est.agent1_cost_usd + est.agent2_cost_usd
         return est
 

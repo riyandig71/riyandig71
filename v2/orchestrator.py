@@ -122,32 +122,43 @@ def estimate_cost(
     est.total_tables_b = len(doc_b.tables)
     est.total_table_cells = sum(t.rows * t.cols for t in doc_a.tables)
 
-    # Token estimation: ~4 chars per token
+    # Token estimation: ~3.5 chars per token (legal text is denser than average)
     total_chars_a = sum(len(p.text) for p in doc_a.paragraphs)
     total_chars_b = sum(len(p.text) for p in doc_b.paragraphs)
-    prompt_overhead = 2000  # system prompt tokens
+    prompt_overhead = 2500  # system prompt tokens
 
-    # Agent 1: system + doc_a + doc_b paragraphs
-    a1_input = prompt_overhead + (total_chars_a + total_chars_b) // 4
-    a1_output = est.total_sentences * 50  # ~50 tokens per decision entry
+    # Agent 1 INPUT: system prompt + all doc_a paragraphs + all doc_b paragraphs
+    # Sent in batches, but total tokens across all batches is the same
+    a1_input = prompt_overhead * ((est.total_paragraphs_a // 30) + 1) + \
+               (total_chars_a + total_chars_b) // 3
 
-    # Agent 2: system + doc_a + doc_b + agent1 output
-    a2_input = prompt_overhead + (total_chars_a + total_chars_b) // 4 + a1_output
-    a2_output = a1_output  # similar size
+    # Agent 1 OUTPUT: each decision includes original text + revised + reason
+    # Calibrated against CLOD 418 actual cost (130 tok/sent → ~105% of actual)
+    a1_output = est.total_sentences * 130
 
-    est.estimated_input_tokens = a1_input + a2_input
-    est.estimated_output_tokens = a1_output + a2_output
+    # Agent 2 INPUT: system prompt + doc_a + doc_b + agent1 full output
+    a2_input = prompt_overhead * ((est.total_paragraphs_a // 30) + 1) + \
+               (total_chars_a + total_chars_b) // 3 + a1_output
+
+    # Agent 2 OUTPUT: similar to Agent 1 (validates each decision)
+    a2_output = est.total_sentences * 130
+
+    # Retry overhead: ~20% extra for 529 errors and truncated responses
+    retry_multiplier = 1.20
+
+    est.estimated_input_tokens = int((a1_input + a2_input) * retry_multiplier)
+    est.estimated_output_tokens = int((a1_output + a2_output) * retry_multiplier)
 
     a1_pricing = PRICING.get(agent1_model, PRICING[MODEL_STRONG])
     a2_pricing = PRICING.get(agent2_model, PRICING[MODEL_STRONG])
 
     est.agent1_cost_usd = (
-        (a1_input / 1_000_000) * a1_pricing["input"]
-        + (a1_output / 1_000_000) * a1_pricing["output"]
+        (a1_input * retry_multiplier / 1_000_000) * a1_pricing["input"]
+        + (a1_output * retry_multiplier / 1_000_000) * a1_pricing["output"]
     )
     est.agent2_cost_usd = (
-        (a2_input / 1_000_000) * a2_pricing["input"]
-        + (a2_output / 1_000_000) * a2_pricing["output"]
+        (a2_input * retry_multiplier / 1_000_000) * a2_pricing["input"]
+        + (a2_output * retry_multiplier / 1_000_000) * a2_pricing["output"]
     )
     est.total_cost_usd = est.agent1_cost_usd + est.agent2_cost_usd
     return est
