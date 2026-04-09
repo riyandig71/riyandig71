@@ -72,18 +72,44 @@ def call_claude(
     system: str,
     user_message: str,
     model: str = MODEL_STRONG,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
+    max_retries: int = 5,
 ) -> str:
-    """Send a request to the Claude API.  Returns raw text response."""
+    """Send a request to the Claude API with retry on rate-limit errors.
+
+    Retries up to *max_retries* times with exponential backoff (2s, 4s, 8s, 16s, 32s)
+    on 429 rate-limit errors.
+    """
+    import time as _time
+
     logger.debug("Calling model=%s, system_len=%d, user_len=%d",
                  model, len(system), len(user_message))
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    return resp.content[0].text
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            return resp.content[0].text
+        except anthropic.RateLimitError as exc:
+            if attempt == max_retries:
+                raise
+            wait = 2 ** attempt  # 2, 4, 8, 16, 32 seconds
+            logger.warning("Rate limited (attempt %d/%d). Waiting %ds...",
+                           attempt, max_retries, wait)
+            _time.sleep(wait)
+        except anthropic.APIStatusError as exc:
+            if exc.status_code >= 500 and attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning("Server error %d (attempt %d/%d). Waiting %ds...",
+                               exc.status_code, attempt, max_retries, wait)
+                _time.sleep(wait)
+            else:
+                raise
+    return ""  # unreachable, but satisfies type checker
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +119,11 @@ def call_claude(
 def _extract_json_array(text: str) -> list[dict[str, Any]]:
     """Extract a JSON array from model output.
 
-    Tries multiple strategies:
+    Tries multiple strategies in order:
     1. Parse entire text as JSON.
-    2. Find outermost [ ... ] bracket pair.
-    3. Find JSON inside ```json ... ``` fences.
+    2. Find JSON inside ```json ... ``` fences.
+    3. Find the LARGEST outermost [ ... ] bracket pair (handles prose around JSON).
+    4. Try to repair truncated JSON by adding missing closing brackets.
     """
     text = text.strip()
 
@@ -108,30 +135,79 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: find ```json ... ``` block
-    fence_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', text, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1))
-        except json.JSONDecodeError:
-            pass
+    # Strategy 2: find ```json ... ``` block (non-greedy then greedy)
+    for pattern in [
+        r'```(?:json)?\s*(\[.*?\])\s*```',
+        r'```(?:json)?\s*(\[.*\])\s*```',
+    ]:
+        fence_match = re.search(pattern, text, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1))
+            except json.JSONDecodeError:
+                continue
 
-    # Strategy 3: find outermost [ ... ]
+    # Strategy 3: find the LARGEST outermost [ ... ] bracket pair
+    # Scan for all top-level arrays, pick the longest one
+    candidates: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "[":
+            depth = 0
+            start = i
+            for j in range(i, len(text)):
+                if text[j] == "[":
+                    depth += 1
+                elif text[j] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[start:j + 1])
+                        i = j + 1
+                        break
+            else:
+                # Unclosed bracket — try truncated repair (Strategy 4)
+                break
+            continue
+        i += 1
+
+    # Try candidates from longest to shortest
+    for candidate in sorted(candidates, key=len, reverse=True):
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 4: truncated JSON — model hit max_tokens
+    # Find last [ and try adding ] to close it
     start = text.find("[")
     if start >= 0:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "[":
-                depth += 1
-            elif text[i] == "]":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:i + 1])
-                    except json.JSONDecodeError:
-                        break
+        fragment = text[start:]
+        # Try progressively trimming from the end and closing
+        for trim in [0, 1, 2, 5, 10, 50, 100]:
+            trimmed = fragment[:len(fragment) - trim] if trim else fragment
+            # Count unclosed brackets
+            open_brackets = trimmed.count("[") - trimmed.count("]")
+            open_braces = trimmed.count("{") - trimmed.count("}")
+            if open_brackets > 0 or open_braces > 0:
+                # Remove trailing comma if present
+                repair = trimmed.rstrip().rstrip(",")
+                repair += "}" * max(open_braces, 0) + "]" * max(open_brackets, 0)
+                try:
+                    result = json.loads(repair)
+                    if isinstance(result, list):
+                        logger.warning(
+                            "JSON was truncated — repaired by closing %d brackets. "
+                            "Got %d entries (some may be missing).",
+                            open_brackets + open_braces, len(result),
+                        )
+                        return result
+                except json.JSONDecodeError:
+                    continue
 
-    logger.error("Failed to extract JSON array from response (len=%d)", len(text))
+    logger.error("Failed to extract JSON array from response (len=%d). "
+                 "First 500 chars: %s", len(text), text[:500])
     return []
 
 

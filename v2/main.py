@@ -39,8 +39,8 @@ def main() -> None:
     parser.add_argument("--output", default="review_output.docx", help="Output DOCX path")
     parser.add_argument("--agent1-model", default=MODEL_STRONG)
     parser.add_argument("--agent2-model", default=MODEL_STRONG)
-    parser.add_argument("--batch-size", type=int, default=10,
-                        help="Paragraphs per agent batch (default: 10)")
+    parser.add_argument("--batch-size", type=int, default=30,
+                        help="Paragraphs per agent batch (default: 30)")
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--skip-confirm", action="store_true",

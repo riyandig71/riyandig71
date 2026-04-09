@@ -178,7 +178,7 @@ def _build_batches(
     doc_a: DocumentContent,
     doc_b: DocumentContent,
     para_mapping: list[tuple[int, int | None]],
-    batch_size: int = 10,
+    batch_size: int = 30,
 ) -> list[tuple[list[dict], list[dict]]]:
     """Split mapped paragraphs into batches for agent processing.
 
@@ -237,7 +237,7 @@ class Orchestrator:
         output_path: str | Path = "review_output.docx",
         agent1_model: str = MODEL_STRONG,
         agent2_model: str = MODEL_STRONG,
-        batch_size: int = 10,
+        batch_size: int = 30,
         max_retries: int = 2,
         api_key: str | None = None,
     ) -> None:
@@ -295,7 +295,14 @@ class Orchestrator:
 
         # Step 4: Build batches and run Agent 1
         batches = _build_batches(doc_a, doc_b, para_mapping, self.batch_size)
-        table_diff_dicts = table_diffs_for_agent(all_table_diffs) if all_table_diffs else None
+        # Limit table diffs sent to agent — too many overwhelms the context
+        table_diff_dicts = None
+        if all_table_diffs:
+            limited_diffs = all_table_diffs[:50]  # cap at 50 cell diffs per batch
+            table_diff_dicts = table_diffs_for_agent(limited_diffs)
+            if len(all_table_diffs) > 50:
+                logger.info("Table diffs capped at 50 (total: %d) — rest handled separately",
+                            len(all_table_diffs))
 
         all_a1_decisions: list[ReviewDecision] = []
         for batch_idx, (batch_a, batch_b) in enumerate(batches):
@@ -307,6 +314,11 @@ class Orchestrator:
                 self.client, batch_a, batch_b, td, model=self.agent1_model,
             )
             all_a1_decisions.extend(decisions)
+
+            # Rate-limit protection: pause between batches
+            if batch_idx < len(batches) - 1:
+                import time as _time
+                _time.sleep(3)
 
         result.agent1_decisions = all_a1_decisions
         logger.info("Agent 1 total: %d decisions", len(all_a1_decisions))
@@ -339,6 +351,11 @@ class Orchestrator:
                 self.client, batch_a, batch_b, batch_a1, model=self.agent2_model,
             )
             all_a2_decisions.extend(decisions)
+
+            # Rate-limit protection
+            if batch_idx < len(batches) - 1:
+                import time as _time
+                _time.sleep(3)
 
         result.agent2_decisions = all_a2_decisions
         logger.info("Agent 2 total: %d decisions", len(all_a2_decisions))
