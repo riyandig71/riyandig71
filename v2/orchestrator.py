@@ -372,8 +372,11 @@ class Orchestrator:
         result.agent1_decisions = all_a1_decisions
         logger.info("Agent 1 total: %d decisions", len(all_a1_decisions))
 
+        # Build Doc B full text for reference-preservation checks
+        _doc_b_text = " ".join(p.text for p in doc_b.paragraphs)
+
         # Step 5: Validate Agent 1 output
-        a1_validation = validate_decisions(all_a1_decisions, doc_a, auto_fix=True)
+        a1_validation = validate_decisions(all_a1_decisions, doc_a, doc_b_text=_doc_b_text, auto_fix=True)
         if a1_validation.fixed_decisions:
             all_a1_decisions = a1_validation.fixed_decisions
 
@@ -430,7 +433,7 @@ class Orchestrator:
 
         # Step 7: Final validation
         final_decisions = all_a2_decisions if all_a2_decisions else all_a1_decisions
-        final_validation = validate_decisions(final_decisions, doc_a, auto_fix=True)
+        final_validation = validate_decisions(final_decisions, doc_a, doc_b_text=_doc_b_text, auto_fix=True)
         result.validation = final_validation
 
         if final_validation.fixed_decisions:

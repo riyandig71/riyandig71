@@ -42,7 +42,22 @@ STRICT REVISION RULES (apply to every decision):
   5. wording is too informal for a formal legal document,
   6. factual content or table data differs from Document B.
 - If unsure, use action UNCERTAIN — do not invent.
-- No sentence may be skipped."""
+- No sentence may be skipped.
+
+ABSOLUTE PRESERVATION RULES — NEVER violate these:
+- NEVER delete or modify document reference numbers (e.g. No. 89/RB/IV/2025)
+  that appear in BOTH Document A and Document B.
+- NEVER delete or modify case numbers, court reference numbers, or docket numbers.
+- NEVER delete or modify dates that are identical in both documents.
+- NEVER delete or modify party names, lawyer names, or law firm names
+  unless Document B explicitly uses a different name.
+- NEVER delete or modify addresses that are identical in both documents.
+- NEVER delete header/letterhead content that matches Document B.
+- If Document A has "SH" and Document B has "S.H.", this is a formatting
+  difference — use KEEP, do not delete the entire text.
+- If a paragraph contains BOTH text that needs revision AND text that must
+  be preserved (like a reference number), ONLY revise the specific part
+  that needs change. Do NOT replace the entire paragraph."""
 
 # ---------------------------------------------------------------------------
 # Agent 1 prompt

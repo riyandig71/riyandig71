@@ -411,7 +411,8 @@ class Orchestrator:
                 ckpt.mark_agent1_done()
 
             pr.agent1_decisions = all_a1
-            a1_val = validate_decisions(all_a1, doc_a, auto_fix=True)
+            _doc_b_text = " ".join(p.text for p in doc_b.paragraphs)
+            a1_val = validate_decisions(all_a1, doc_a, doc_b_text=_doc_b_text, auto_fix=True)
             if a1_val.fixed_decisions:
                 all_a1 = a1_val.fixed_decisions
 
@@ -454,7 +455,7 @@ class Orchestrator:
 
             # Final validation
             final = all_a2 if all_a2 else all_a1
-            final_val = validate_decisions(final, doc_a, auto_fix=True)
+            final_val = validate_decisions(final, doc_a, doc_b_text=_doc_b_text, auto_fix=True)
             pr.validation = final_val
             if final_val.fixed_decisions:
                 final = final_val.fixed_decisions

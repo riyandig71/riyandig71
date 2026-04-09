@@ -15,6 +15,7 @@ V2 adds:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from .review_engine import Action, ReviewDecision
@@ -153,12 +154,63 @@ def check_replace_sanity(decisions: list[ReviewDecision]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Auto-fix: clean up decisions
+# Check 5: Reference number / identifier preservation
 # ---------------------------------------------------------------------------
 
-def auto_fix_decisions(decisions: list[ReviewDecision]) -> list[ReviewDecision]:
+# Patterns that identify legal reference numbers, case numbers, dates, etc.
+_REFERENCE_PATTERNS = [
+    re.compile(r'No\.\s*[\d/\-A-Z]+', re.IGNORECASE),           # No. 89/RB/IV/2025
+    re.compile(r'Nomor\s*[\d/\-A-Z]+', re.IGNORECASE),          # Nomor 89/RB/IV/2025
+    re.compile(r'\d+/[\w\-]+/\d{4}'),                            # 89/RB/IV/2025
+    re.compile(r'(?:Perkara|Case)\s+No\.\s*\S+', re.IGNORECASE), # Case No. XYZ
+    re.compile(r'\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b'),  # dates
+]
+
+
+def check_reference_preservation(
+    decisions: list[ReviewDecision],
+    doc_b_text: str = "",
+) -> list[str]:
+    """Detect REPLACE or DELETE that removes reference numbers present in Doc B.
+
+    If a reference number (case number, document number, date) exists in
+    the original text AND in Document B, it must not be deleted.
+    """
+    issues: list[str] = []
+    for d in decisions:
+        if d.action not in (Action.REPLACE, Action.DELETE):
+            continue
+        if not d.original:
+            continue
+
+        for pattern in _REFERENCE_PATTERNS:
+            refs_in_original = pattern.findall(d.original)
+            for ref in refs_in_original:
+                ref_clean = ref.strip()
+                if not ref_clean:
+                    continue
+                # Check if this reference is in Doc B
+                in_doc_b = ref_clean in doc_b_text if doc_b_text else True
+                # Check if preserved in revised text
+                if d.action == Action.DELETE:
+                    in_revised = False
+                else:
+                    in_revised = ref_clean in (d.revised or "")
+
+                if in_doc_b and not in_revised:
+                    issues.append(
+                        f"para_idx={d.para_idx}: {d.action.value} removes reference "
+                        f"'{ref_clean}' which exists in Document B"
+                    )
+    return issues
+
+def auto_fix_decisions(
+    decisions: list[ReviewDecision],
+    doc_b_text: str = "",
+) -> list[ReviewDecision]:
     """Apply automatic fixes to common issues.
 
+    - Revert REPLACE/DELETE that removes reference numbers present in Doc B.
     - Strip original text from revised text (fix append corruption).
     - Convert identical REPLACE to KEEP.
     - Deduplicate entries (keep last).
@@ -168,6 +220,27 @@ def auto_fix_decisions(decisions: list[ReviewDecision]) -> list[ReviewDecision]:
 
     for i, d in enumerate(decisions):
         key = (d.para_idx, d.sent_idx)
+
+        # Fix reference deletion — revert to KEEP if reference is in Doc B
+        if d.action in (Action.REPLACE, Action.DELETE) and d.original:
+            for pattern in _REFERENCE_PATTERNS:
+                refs = pattern.findall(d.original)
+                for ref in refs:
+                    ref_clean = ref.strip()
+                    in_doc_b = ref_clean in doc_b_text if doc_b_text else False
+                    in_revised = ref_clean in (d.revised or "") if d.action == Action.REPLACE else False
+                    if in_doc_b and not in_revised:
+                        logger.info(
+                            "Auto-fixed: para_idx=%d — reverted %s→KEEP "
+                            "(preserving reference '%s' found in Doc B)",
+                            d.para_idx, d.action.value, ref_clean,
+                        )
+                        d.action = Action.KEEP
+                        d.revised = ""
+                        d.reason = f"(auto-fixed: preserving reference '{ref_clean}' from Doc B)"
+                        break
+                if d.action == Action.KEEP:
+                    break
 
         # Fix metadata contamination — strip prompt artifacts from revised text
         if d.action == Action.REPLACE and d.revised:
@@ -220,11 +293,13 @@ def validate_decisions(
     decisions: list[ReviewDecision],
     doc_a: DocumentContent,
     *,
+    doc_b_text: str = "",
     auto_fix: bool = True,
 ) -> ValidationResult:
     """Run all validation checks on a set of decisions.
 
     If auto_fix=True, attempts to fix common issues automatically.
+    Pass doc_b_text to enable reference-preservation checks.
     """
     result = ValidationResult()
 
@@ -233,6 +308,7 @@ def validate_decisions(
     dupe_issues = check_duplication(decisions)
     completeness_issues = check_completeness(decisions, doc_a)
     replace_issues = check_replace_sanity(decisions)
+    ref_issues = check_reference_preservation(decisions, doc_b_text) if doc_b_text else []
 
     for issue in append_issues:
         result.add_error(f"APPEND CORRUPTION: {issue}")
@@ -242,19 +318,25 @@ def validate_decisions(
         result.add_warning(f"MISSING: {issue}")
     for issue in replace_issues:
         result.add_warning(f"REPLACE ISSUE: {issue}")
+    for issue in ref_issues:
+        result.add_error(f"REFERENCE DELETION: {issue}")
 
-    # Auto-fix if requested
-    if auto_fix and (append_issues or dupe_issues or replace_issues):
+    # Auto-fix if requested — always run to catch reference deletions
+    needs_fix = append_issues or dupe_issues or replace_issues or ref_issues
+    if auto_fix and needs_fix:
         logger.info("Running auto-fix on %d decisions...", len(decisions))
-        result.fixed_decisions = auto_fix_decisions(decisions)
+        result.fixed_decisions = auto_fix_decisions(decisions, doc_b_text)
         # Re-check after fix
         post_append = check_append_corruption(result.fixed_decisions)
-        if not post_append:
-            result.passed = True  # fixed the errors
-            logger.info("Auto-fix resolved append corruption")
+        post_ref = check_reference_preservation(result.fixed_decisions, doc_b_text) if doc_b_text else []
+        if not post_append and not post_ref:
+            result.passed = True
+            logger.info("Auto-fix resolved all issues")
         else:
             for issue in post_append:
                 result.add_error(f"UNFIXED APPEND: {issue}")
+            for issue in post_ref:
+                result.add_error(f"UNFIXED REF DELETION: {issue}")
     elif not result.errors:
         result.fixed_decisions = decisions
 
