@@ -613,29 +613,59 @@ def _add_tracked_insertion(paragraph, run_index: int, new_text: str, author: str
         p_elem.append(ins_elem)
 
 
-def _ensure_comments_part(doc: DocxDocument) -> etree._Element:
-    """Return the <w:comments> root element, creating the comments part if needed."""
-    COMMENTS_URI = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+_COMMENTS_URI = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+_COMMENTS_CT = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
+
+# Module-level store for comments across a single build run.
+# Key: id(doc.part) → (Part, etree._Element holding <w:comments>)
+_comments_cache: dict[int, tuple[Any, etree._Element]] = {}
+
+
+def _ensure_comments_part(doc: DocxDocument) -> tuple[Any, etree._Element]:
+    """Return (Part, <w:comments> root element), creating the part if needed."""
+    from docx.opc.part import Part as OpcPart
+    from docx.opc.packuri import PackURI
+
+    cache_key = id(doc.part)
+    if cache_key in _comments_cache:
+        return _comments_cache[cache_key]
+
+    # Check if the document already has a comments relationship
     for rel in doc.part.rels.values():
-        if rel.reltype == COMMENTS_URI:
-            return rel.target_part._element
+        if rel.reltype == _COMMENTS_URI:
+            root = etree.fromstring(rel.target_part.blob)
+            _comments_cache[cache_key] = (rel.target_part, root)
+            return _comments_cache[cache_key]
+
     # Create a new comments part
-    from docx.opc.part import Part
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
     comments_xml = (
-        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
-        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
     )
-    comments_element = etree.fromstring(comments_xml.encode("utf-8"))
-    comments_part = Part(
-        partname="/word/comments.xml",
-        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
-        blob=etree.tostring(comments_element, xml_declaration=True, encoding="UTF-8"),
+    comments_root = etree.fromstring(comments_xml)
+    comments_part = OpcPart(
+        partname=PackURI("/word/comments.xml"),
+        content_type=_COMMENTS_CT,
+        blob=comments_xml,
         package=doc.part.package,
     )
-    comments_part._element = comments_element
-    doc.part.relate_to(comments_part, COMMENTS_URI)
-    return comments_element
+    doc.part.relate_to(comments_part, _COMMENTS_URI)
+    _comments_cache[cache_key] = (comments_part, comments_root)
+    return comments_part, comments_root
+
+
+def _flush_comments(doc: DocxDocument) -> None:
+    """Serialise the in-memory comments tree back into the Part blob.
+
+    Must be called before doc.save() so that accumulated comments are
+    written into the DOCX package.
+    """
+    cache_key = id(doc.part)
+    if cache_key not in _comments_cache:
+        return
+    part, root = _comments_cache[cache_key]
+    part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    del _comments_cache[cache_key]
 
 
 def _add_comment_to_paragraph(
@@ -650,7 +680,7 @@ def _add_comment_to_paragraph(
     plus commentRangeStart/End and commentReference in the paragraph, so the
     comment is visible in Word's review pane.
     """
-    comments_root = _ensure_comments_part(doc)
+    comments_part, comments_root = _ensure_comments_part(doc)
     comment_id = str(_next_rev_id())
 
     # --- 1. Create <w:comment> in the comments part ---
@@ -855,6 +885,9 @@ def build_tracked_changes_docx(
                             break
                     comment_para = _find_best_paragraph(page_paras, sent_text) if sent_text else page_paras[0]
                     _add_comment_to_paragraph(comment_para, notes, _AUTHOR_AGENT2, doc)
+
+    # Flush accumulated comments into the Part blob before saving
+    _flush_comments(doc)
 
     out = Path(output_path)
     doc.save(str(out))
