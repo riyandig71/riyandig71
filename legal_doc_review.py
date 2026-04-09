@@ -45,6 +45,15 @@ MODEL_CHEAP: str = "claude-haiku-4-5-20251001"
 MODEL_STRONG: str = "claude-sonnet-4-6"
 
 # ---------------------------------------------------------------------------
+# Pricing per 1M tokens (USD) — update when Anthropic changes pricing
+# ---------------------------------------------------------------------------
+PRICING: dict[str, dict[str, float]] = {
+    "claude-sonnet-4-6":       {"input": 3.00, "output": 15.00},
+    "claude-opus-4-6":         {"input": 15.00, "output": 75.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+}
+
+# ---------------------------------------------------------------------------
 # Prompt constants — stored verbatim
 # ---------------------------------------------------------------------------
 
@@ -473,6 +482,179 @@ def validate_ledger_completeness(
     """Return a list of sentence IDs that are missing from *returned_ledger*."""
     returned_ids = {entry.get("sentence_id", "") for entry in returned_ledger}
     return sorted(expected_ids - returned_ids)
+
+
+# ---------------------------------------------------------------------------
+# Cost estimation
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~1 token per 4 characters for English text."""
+    return max(len(text) // 4, 1)
+
+
+@dataclass
+class CostEstimate:
+    """Detailed cost breakdown for a review run."""
+    total_pages: int = 0
+    total_paragraphs: int = 0
+    total_sentences: int = 0
+    total_words: int = 0
+    total_characters: int = 0
+    estimated_tokens_doc_a: int = 0
+    estimated_tokens_doc_b: int = 0
+    estimated_input_tokens: int = 0
+    estimated_output_tokens: int = 0
+    agent1_model: str = ""
+    agent2_model: str = ""
+    agent1_cost_usd: float = 0.0
+    agent2_cost_usd: float = 0.0
+    total_cost_usd: float = 0.0
+
+    def display(self) -> str:
+        """Return a human-readable cost summary."""
+        lines = [
+            "",
+            "=" * 60,
+            "  COST ESTIMATE — BEFORE EXECUTION",
+            "=" * 60,
+            "",
+            "  DOCUMENT ANALYSIS",
+            f"    Pages to process:    {self.total_pages}",
+            f"    Paragraphs:          {self.total_paragraphs}",
+            f"    Sentences:           {self.total_sentences}",
+            f"    Words:               {self.total_words:,}",
+            f"    Characters:          {self.total_characters:,}",
+            "",
+            "  TOKEN ESTIMATES",
+            f"    Document A tokens:   ~{self.estimated_tokens_doc_a:,}",
+            f"    Document B tokens:   ~{self.estimated_tokens_doc_b:,}",
+            f"    Total input tokens:  ~{self.estimated_input_tokens:,}",
+            f"    Total output tokens: ~{self.estimated_output_tokens:,}",
+            "",
+            "  MODEL & PRICING",
+            f"    Agent 1 model:       {self.agent1_model}",
+            f"    Agent 2 model:       {self.agent2_model}",
+            "",
+            "  COST BREAKDOWN",
+            f"    Agent 1 (per page):  ${self.agent1_cost_usd / max(self.total_pages, 1):.4f}",
+            f"    Agent 2 (per page):  ${self.agent2_cost_usd / max(self.total_pages, 1):.4f}",
+            f"    Agent 1 total:       ${self.agent1_cost_usd:.4f}",
+            f"    Agent 2 total:       ${self.agent2_cost_usd:.4f}",
+            "    " + "-" * 30,
+            f"    ESTIMATED TOTAL:     ${self.total_cost_usd:.4f}",
+            "",
+            "=" * 60,
+        ]
+        return "\n".join(lines)
+
+
+def estimate_cost(
+    doc_a_path: str | Path,
+    doc_b_path: str | Path,
+    selected_pages: list[int],
+    total_pages_b: int,
+    agent1_model: str = MODEL_STRONG,
+    agent2_model: str = MODEL_STRONG,
+) -> CostEstimate:
+    """Compute a cost estimate before running the review pipeline.
+
+    Analyses the selected pages to count paragraphs, sentences, words,
+    characters, and estimated tokens, then calculates approximate API
+    cost based on model pricing.
+    """
+    est = CostEstimate()
+    est.total_pages = len(selected_pages)
+    est.agent1_model = agent1_model
+    est.agent2_model = agent2_model
+
+    total_doc_a_text = ""
+    total_doc_b_text = ""
+
+    for pg in selected_pages:
+        # Document A
+        a_text = extract_page_text(doc_a_path, pg)
+        paragraphs_a = extract_page_paragraphs(doc_a_path, pg)
+        sentences_a = segment_sentences(a_text)
+
+        est.total_paragraphs += len(paragraphs_a)
+        est.total_sentences += len(sentences_a)
+        est.total_words += len(a_text.split())
+        est.total_characters += len(a_text)
+        total_doc_a_text += a_text + "\n"
+
+        # Document B (if available for this page)
+        if pg <= total_pages_b:
+            b_text = extract_page_text(doc_b_path, pg)
+            total_doc_b_text += b_text + "\n"
+
+    est.estimated_tokens_doc_a = _estimate_tokens(total_doc_a_text)
+    est.estimated_tokens_doc_b = _estimate_tokens(total_doc_b_text)
+
+    # --- Per-page token budget ---
+    # Agent 1 input: system prompt + doc_a_page + doc_b_page + ledger
+    prompt_overhead = _estimate_tokens(AGENT1_PROMPT) + 200  # ledger JSON ~200 tokens
+    agent1_input_per_page = (
+        prompt_overhead
+        + (est.estimated_tokens_doc_a // max(est.total_pages, 1))
+        + (est.estimated_tokens_doc_b // max(est.total_pages, 1))
+    )
+    # Agent 1 output: revised text + ledger JSON (~same size as input page + 30%)
+    agent1_output_per_page = int(agent1_input_per_page * 0.8)
+
+    # Agent 2 input: system prompt + doc_a_page + doc_b_page + agent1_output + ledger
+    prompt_overhead_2 = _estimate_tokens(AGENT2_PROMPT) + 200
+    agent2_input_per_page = (
+        prompt_overhead_2
+        + (est.estimated_tokens_doc_a // max(est.total_pages, 1))
+        + (est.estimated_tokens_doc_b // max(est.total_pages, 1))
+        + agent1_output_per_page  # agent 1's revised text
+    )
+    agent2_output_per_page = int(agent2_input_per_page * 0.7)
+
+    # Total across all pages
+    total_input = (agent1_input_per_page + agent2_input_per_page) * est.total_pages
+    total_output = (agent1_output_per_page + agent2_output_per_page) * est.total_pages
+
+    est.estimated_input_tokens = total_input
+    est.estimated_output_tokens = total_output
+
+    # --- Cost calculation ---
+    a1_pricing = PRICING.get(agent1_model, PRICING[MODEL_STRONG])
+    a2_pricing = PRICING.get(agent2_model, PRICING[MODEL_STRONG])
+
+    a1_input_total = agent1_input_per_page * est.total_pages
+    a1_output_total = agent1_output_per_page * est.total_pages
+    a2_input_total = agent2_input_per_page * est.total_pages
+    a2_output_total = agent2_output_per_page * est.total_pages
+
+    est.agent1_cost_usd = (
+        (a1_input_total / 1_000_000) * a1_pricing["input"]
+        + (a1_output_total / 1_000_000) * a1_pricing["output"]
+    )
+    est.agent2_cost_usd = (
+        (a2_input_total / 1_000_000) * a2_pricing["input"]
+        + (a2_output_total / 1_000_000) * a2_pricing["output"]
+    )
+    est.total_cost_usd = est.agent1_cost_usd + est.agent2_cost_usd
+
+    return est
+
+
+def confirm_execution(estimate: CostEstimate) -> bool:
+    """Display cost estimate and ask user for confirmation.
+
+    Returns True if user confirms, False otherwise.
+    """
+    print(estimate.display())
+    while True:
+        answer = input("\n  Proceed with execution? (y/n): ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            print("  Execution cancelled.")
+            return False
+        print("  Please enter 'y' or 'n'.")
 
 
 # ---------------------------------------------------------------------------
@@ -1268,10 +1450,29 @@ class Orchestrator:
 
     # ----- public API -----
 
-    def run(self) -> Path:
-        """Execute the full review pipeline and return the output DOCX path."""
+    def run(self, skip_confirmation: bool = False) -> Path | None:
+        """Execute the full review pipeline and return the output DOCX path.
+
+        Shows a cost estimate and asks for user confirmation before
+        making any API calls.  Pass *skip_confirmation=True* to bypass
+        the prompt (e.g. in automated pipelines).
+        """
         self._detect_pages()
         self._select_pages()
+
+        # --- Cost estimate & user confirmation ---
+        est = estimate_cost(
+            self.doc_a_path,
+            self.doc_b_path,
+            self.selected_pages,
+            self.total_pages_b,
+            agent1_model=self.agent1_model,
+            agent2_model=self.agent2_model,
+        )
+        if not skip_confirmation:
+            if not confirm_execution(est):
+                return None
+
         self._process_pages()
         return self._generate_output()
 
@@ -1417,20 +1618,12 @@ def main() -> None:
         api_key=args.api_key,
     )
 
-    # ---- Step 3: Detect total pages ----
-    orchestrator._detect_pages()
-    logger.info("Document A total pages: %d", orchestrator.total_pages_a)
-    logger.info("Document B total pages: %d", orchestrator.total_pages_b)
+    # ---- Step 3-7: Run with cost estimate + confirmation ----
+    output_file = orchestrator.run()
 
-    # ---- Step 4: Select page scope ----
-    orchestrator._select_pages()
-    logger.info("Pages to process: %s", orchestrator.selected_pages)
-
-    # ---- Step 5-6: Run Agent 1 and Agent 2 per page ----
-    orchestrator._process_pages()
-
-    # ---- Step 7: Generate final DOCX markup output ----
-    output_file = orchestrator._generate_output()
+    if output_file is None:
+        logger.info("User cancelled execution.")
+        return
 
     # ---- Summary ----
     total = len(orchestrator.page_results)
