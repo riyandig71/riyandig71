@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 review_output.docx
+review_output_v2.docx
 test_*.docx
 .env
