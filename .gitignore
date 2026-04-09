@@ -4,3 +4,5 @@ review_output.docx
 review_output_v2.docx
 test_*.docx
 .env
+*_split/
+.checkpoint_*
