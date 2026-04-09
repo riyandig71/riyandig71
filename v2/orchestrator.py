@@ -39,10 +39,12 @@ from .review_engine import (
     ReviewDecision,
     run_agent1,
     run_agent2,
+    parse_decisions,
 )
 from .validation import validate_decisions, ValidationResult
 from .redline_engine import apply_redline, AUTHOR_AGENT1, AUTHOR_AGENT2
-from .prompt_store import MODEL_STRONG, MODEL_CHEAP, PRICING, load_prompts
+from .checkpoint import Checkpoint
+from .prompt_store import MODEL_STRONG, MODEL_CHEAP, PRICING
 
 logger = logging.getLogger("v2.orchestrator")
 
@@ -293,32 +295,68 @@ class Orchestrator:
             table_diffs=all_table_diffs,
         )
 
+        # --- Checkpoint: resume support ---
+        ckpt_name = self.doc_a_path.stem.replace(" ", "_")
+        ckpt_path = self.output_path.parent / f".checkpoint_{ckpt_name}.json"
+        ckpt = Checkpoint(ckpt_path)
+
+        if ckpt.is_complete():
+            logger.info("Previous run already completed. Delete checkpoint to re-run.")
+            logger.info("Checkpoint: %s", ckpt_path)
+            ckpt.delete()
+
         # Step 4: Build batches and run Agent 1
         batches = _build_batches(doc_a, doc_b, para_mapping, self.batch_size)
-        # Limit table diffs sent to agent — too many overwhelms the context
         table_diff_dicts = None
         if all_table_diffs:
-            limited_diffs = all_table_diffs[:50]  # cap at 50 cell diffs per batch
+            limited_diffs = all_table_diffs[:50]
             table_diff_dicts = table_diffs_for_agent(limited_diffs)
             if len(all_table_diffs) > 50:
-                logger.info("Table diffs capped at 50 (total: %d) — rest handled separately",
-                            len(all_table_diffs))
+                logger.info("Table diffs capped at 50 (total: %d)", len(all_table_diffs))
 
         all_a1_decisions: list[ReviewDecision] = []
-        for batch_idx, (batch_a, batch_b) in enumerate(batches):
-            logger.info("Agent 1: batch %d/%d (%d paragraphs)",
-                        batch_idx + 1, len(batches), len(batch_a))
-            # Only include table diffs in first batch
-            td = table_diff_dicts if batch_idx == 0 else None
-            decisions = run_agent1(
-                self.client, batch_a, batch_b, td, model=self.agent1_model,
-            )
-            all_a1_decisions.extend(decisions)
 
-            # Rate-limit protection: pause between batches
-            if batch_idx < len(batches) - 1:
-                import time as _time
-                _time.sleep(3)
+        if ckpt.is_agent1_done():
+            # Resume: Agent 1 already finished — reload decisions
+            logger.info("RESUMING: Agent 1 already done — loading %d saved decisions",
+                        len(ckpt.get_agent1_decisions()))
+            all_a1_decisions = parse_decisions(ckpt.get_agent1_decisions())
+        else:
+            # Load any previously completed batches
+            saved_a1 = ckpt.get_agent1_decisions()
+            if saved_a1:
+                all_a1_decisions = parse_decisions(saved_a1)
+                logger.info("RESUMING: loaded %d decisions from previous Agent 1 batches",
+                            len(all_a1_decisions))
+
+            for batch_idx, (batch_a, batch_b) in enumerate(batches):
+                if ckpt.is_agent1_batch_done(batch_idx):
+                    logger.info("Agent 1: batch %d/%d — SKIPPED (checkpoint)",
+                                batch_idx + 1, len(batches))
+                    continue
+
+                logger.info("Agent 1: batch %d/%d (%d paragraphs)",
+                            batch_idx + 1, len(batches), len(batch_a))
+                td = table_diff_dicts if batch_idx == 0 else None
+                decisions = run_agent1(
+                    self.client, batch_a, batch_b, td, model=self.agent1_model,
+                )
+                all_a1_decisions.extend(decisions)
+
+                # Save checkpoint after each batch
+                dec_dicts = [
+                    {"para_idx": d.para_idx, "sent_idx": d.sent_idx,
+                     "element_type": d.element_type, "action": d.action.value,
+                     "original": d.original, "revised": d.revised, "reason": d.reason}
+                    for d in decisions
+                ]
+                ckpt.save_agent1_batch(batch_idx, dec_dicts)
+
+                if batch_idx < len(batches) - 1:
+                    import time as _time
+                    _time.sleep(3)
+
+            ckpt.mark_agent1_done()
 
         result.agent1_decisions = all_a1_decisions
         logger.info("Agent 1 total: %d decisions", len(all_a1_decisions))
@@ -330,13 +368,23 @@ class Orchestrator:
 
         # Step 6: Run Agent 2 on each batch
         all_a2_decisions: list[ReviewDecision] = []
-        # Re-batch Agent 1 decisions by batch alignment
         a1_by_para: dict[int, list[ReviewDecision]] = {}
         for d in all_a1_decisions:
             a1_by_para.setdefault(d.para_idx, []).append(d)
 
+        # Load any previously completed Agent 2 batches
+        saved_a2 = ckpt.get_agent2_decisions()
+        if saved_a2:
+            all_a2_decisions = parse_decisions(saved_a2)
+            logger.info("RESUMING: loaded %d decisions from previous Agent 2 batches",
+                        len(all_a2_decisions))
+
         for batch_idx, (batch_a, batch_b) in enumerate(batches):
-            # Gather Agent 1 decisions for this batch's paragraphs
+            if ckpt.is_agent2_batch_done(batch_idx):
+                logger.info("Agent 2: batch %d/%d — SKIPPED (checkpoint)",
+                            batch_idx + 1, len(batches))
+                continue
+
             batch_a1: list[ReviewDecision] = []
             for a_dict in batch_a:
                 pidx = a_dict["para_idx"]
@@ -352,7 +400,16 @@ class Orchestrator:
             )
             all_a2_decisions.extend(decisions)
 
-            # Rate-limit protection
+            dec_dicts = [
+                {"para_idx": d.para_idx, "sent_idx": d.sent_idx,
+                 "element_type": d.element_type, "action": d.action.value,
+                 "original": d.original, "revised": d.revised, "reason": d.reason,
+                 "validation": d.validation, "agent1_action": d.agent1_action,
+                 "correction_note": d.correction_note}
+                for d in decisions
+            ]
+            ckpt.save_agent2_batch(batch_idx, dec_dicts)
+
             if batch_idx < len(batches) - 1:
                 import time as _time
                 _time.sleep(3)
@@ -370,29 +427,22 @@ class Orchestrator:
         else:
             result.final_decisions = final_decisions
 
-        # Add table decisions
         if all_table_diffs:
-            table_decisions = table_diffs_to_decisions(all_table_diffs)
-            result.final_decisions.extend(table_decisions)
+            result.final_decisions.extend(table_diffs_to_decisions(all_table_diffs))
 
         # Step 8: Apply redline
         logger.info("Applying %d decisions to DOCX...", len(result.final_decisions))
         result.output_path = apply_redline(
-            self.doc_a_path,
-            doc_a,
-            result.final_decisions,
-            self.output_path,
+            self.doc_a_path, doc_a, result.final_decisions, self.output_path,
         )
 
-        # Summary
+        # Mark complete and clean up checkpoint
+        ckpt.mark_complete()
+        ckpt.delete()
+
         keeps = sum(1 for d in result.final_decisions if d.action == Action.KEEP)
         replaces = sum(1 for d in result.final_decisions if d.action == Action.REPLACE)
-        inserts = sum(1 for d in result.final_decisions if d.action == Action.INSERT)
-        deletes = sum(1 for d in result.final_decisions if d.action == Action.DELETE)
-        uncertain = sum(1 for d in result.final_decisions if d.action == Action.UNCERTAIN)
-        logger.info(
-            "Review complete: KEEP=%d REPLACE=%d INSERT=%d DELETE=%d UNCERTAIN=%d",
-            keeps, replaces, inserts, deletes, uncertain,
-        )
+        logger.info("Review complete: KEEP=%d REPLACE=%d total=%d",
+                     keeps, replaces, len(result.final_decisions))
 
         return result

@@ -37,9 +37,11 @@ from .review_engine import (
     ReviewDecision,
     run_agent1,
     run_agent2,
+    parse_decisions,
 )
 from .validation import validate_decisions, ValidationResult
 from .redline_engine import apply_redline, AUTHOR_AGENT2
+from .checkpoint import Checkpoint
 from .prompt_store import MODEL_STRONG, MODEL_CHEAP, PRICING, load_prompts
 
 logger = logging.getLogger("v3.orchestrator")
@@ -253,6 +255,19 @@ class Orchestrator:
             else:
                 logger.error("Part %d failed: %s", part.part_number, pr.error)
 
+        # Step 6: Merge all parts into single output DOCX
+        if resolved.doc_a_is_multipart:
+            merged_path = self.output_dir / f"{resolved.doc_a_label}_redline_MERGED.docx"
+            successful_parts = [pr for pr in result.part_results if pr.success and pr.output_path]
+            if len(successful_parts) > 1:
+                _merge_redline_parts(successful_parts, merged_path)
+                logger.info("Merged output: %s", merged_path)
+            elif len(successful_parts) == 1:
+                # Only one part — just copy it as the merged output
+                import shutil
+                shutil.copy2(str(successful_parts[0].output_path), str(merged_path))
+                logger.info("Single part copied as merged: %s", merged_path)
+
         return result
 
     def _estimate_cost(
@@ -322,11 +337,19 @@ class Orchestrator:
         doc_b: DocumentContent,
         output_path: Path,
     ) -> PartResult:
-        """Process a single part of Doc A against Doc B."""
+        """Process a single part of Doc A against Doc B, with checkpoint/resume."""
         pr = PartResult(part=part)
 
+        # Checkpoint per part
+        ckpt_name = f"{part.label}".replace(" ", "_").replace("(", "").replace(")", "")
+        ckpt_path = self.output_dir / f".checkpoint_{ckpt_name}.json"
+        ckpt = Checkpoint(ckpt_path)
+
+        if ckpt.is_complete():
+            logger.info("  Part already completed (checkpoint). Skipping to redline.")
+            ckpt.delete()
+
         try:
-            # Read this part
             logger.info("Reading part: %s", part.path.name)
             doc_a = read_document(part.path)
             pr.doc_a = doc_a
@@ -334,12 +357,10 @@ class Orchestrator:
                         len(doc_a.paragraphs), len(doc_a.tables),
                         sum(len(p.sentences) for p in doc_a.paragraphs))
 
-            # Map paragraphs
             para_mapping = map_paragraphs(doc_a, doc_b)
             matched = sum(1 for _, b in para_mapping if b is not None)
-            logger.info("  Mapped %d paragraphs (%d matched to Doc B)", len(para_mapping), matched)
+            logger.info("  Mapped %d paragraphs (%d matched)", len(para_mapping), matched)
 
-            # Table diffs
             table_mapping = map_tables(doc_a, doc_b)
             all_table_diffs: list[CellDiff] = []
             for a_idx, b_idx in table_mapping:
@@ -349,37 +370,61 @@ class Orchestrator:
                     if a_tbl and b_tbl:
                         all_table_diffs.extend(compare_tables(a_tbl, b_tbl))
 
-            # Build batches
             batches = _build_batches(doc_a, doc_b, para_mapping, self.batch_size)
             table_diff_dicts = None
             if all_table_diffs:
                 table_diff_dicts = table_diffs_for_agent(all_table_diffs[:50])
 
-            # Agent 1
+            # --- Agent 1 with checkpoint ---
             all_a1: list[ReviewDecision] = []
-            for bi, (ba, bb) in enumerate(batches):
-                logger.info("  Agent 1: batch %d/%d (%d paragraphs)", bi + 1, len(batches), len(ba))
-                td = table_diff_dicts if bi == 0 else None
-                decisions = run_agent1(self.client, ba, bb, td, model=self.agent1_model)
-                all_a1.extend(decisions)
-                if bi < len(batches) - 1:
-                    _time.sleep(3)
+            if ckpt.is_agent1_done():
+                all_a1 = parse_decisions(ckpt.get_agent1_decisions())
+                logger.info("  RESUMING: Agent 1 done — loaded %d decisions", len(all_a1))
+            else:
+                saved = ckpt.get_agent1_decisions()
+                if saved:
+                    all_a1 = parse_decisions(saved)
+                    logger.info("  RESUMING: loaded %d Agent 1 decisions", len(all_a1))
+
+                for bi, (ba, bb) in enumerate(batches):
+                    if ckpt.is_agent1_batch_done(bi):
+                        logger.info("  Agent 1: batch %d/%d — SKIPPED (checkpoint)", bi + 1, len(batches))
+                        continue
+                    logger.info("  Agent 1: batch %d/%d (%d paragraphs)", bi + 1, len(batches), len(ba))
+                    td = table_diff_dicts if bi == 0 else None
+                    decisions = run_agent1(self.client, ba, bb, td, model=self.agent1_model)
+                    all_a1.extend(decisions)
+                    dec_dicts = [
+                        {"para_idx": d.para_idx, "sent_idx": d.sent_idx,
+                         "element_type": d.element_type, "action": d.action.value,
+                         "original": d.original, "revised": d.revised, "reason": d.reason}
+                        for d in decisions
+                    ]
+                    ckpt.save_agent1_batch(bi, dec_dicts)
+                    if bi < len(batches) - 1:
+                        _time.sleep(3)
+                ckpt.mark_agent1_done()
 
             pr.agent1_decisions = all_a1
-            logger.info("  Agent 1 total: %d decisions", len(all_a1))
-
-            # Validate Agent 1
             a1_val = validate_decisions(all_a1, doc_a, auto_fix=True)
             if a1_val.fixed_decisions:
                 all_a1 = a1_val.fixed_decisions
 
-            # Agent 2
+            # --- Agent 2 with checkpoint ---
             a1_by_para: dict[int, list[ReviewDecision]] = {}
             for d in all_a1:
                 a1_by_para.setdefault(d.para_idx, []).append(d)
 
             all_a2: list[ReviewDecision] = []
+            saved_a2 = ckpt.get_agent2_decisions()
+            if saved_a2:
+                all_a2 = parse_decisions(saved_a2)
+                logger.info("  RESUMING: loaded %d Agent 2 decisions", len(all_a2))
+
             for bi, (ba, bb) in enumerate(batches):
+                if ckpt.is_agent2_batch_done(bi):
+                    logger.info("  Agent 2: batch %d/%d — SKIPPED (checkpoint)", bi + 1, len(batches))
+                    continue
                 batch_a1 = []
                 for a_dict in ba:
                     batch_a1.extend(a1_by_para.get(a_dict["para_idx"], []))
@@ -388,11 +433,19 @@ class Orchestrator:
                 logger.info("  Agent 2: batch %d/%d (%d decisions)", bi + 1, len(batches), len(batch_a1))
                 decisions = run_agent2(self.client, ba, bb, batch_a1, model=self.agent2_model)
                 all_a2.extend(decisions)
+                dec_dicts = [
+                    {"para_idx": d.para_idx, "sent_idx": d.sent_idx,
+                     "element_type": d.element_type, "action": d.action.value,
+                     "original": d.original, "revised": d.revised, "reason": d.reason,
+                     "validation": d.validation, "agent1_action": d.agent1_action,
+                     "correction_note": d.correction_note}
+                    for d in decisions
+                ]
+                ckpt.save_agent2_batch(bi, dec_dicts)
                 if bi < len(batches) - 1:
                     _time.sleep(3)
 
             pr.agent2_decisions = all_a2
-            logger.info("  Agent 2 total: %d decisions", len(all_a2))
 
             # Final validation
             final = all_a2 if all_a2 else all_a1
@@ -400,24 +453,75 @@ class Orchestrator:
             pr.validation = final_val
             if final_val.fixed_decisions:
                 final = final_val.fixed_decisions
-
-            # Add table decisions
             if all_table_diffs:
                 final.extend(table_diffs_to_decisions(all_table_diffs))
-
             pr.final_decisions = final
 
-            # Apply redline
+            # Apply redline to this part
             logger.info("  Applying %d decisions to DOCX...", len(final))
             pr.output_path = apply_redline(part.path, doc_a, final, output_path)
             pr.success = True
 
+            ckpt.mark_complete()
+            ckpt.delete()
+
             keeps = sum(1 for d in final if d.action == Action.KEEP)
             replaces = sum(1 for d in final if d.action == Action.REPLACE)
-            logger.info("  Done: KEEP=%d, REPLACE=%d, output=%s", keeps, replaces, output_path)
+            logger.info("  Done: KEEP=%d, REPLACE=%d", keeps, replaces)
 
         except Exception as exc:
             pr.error = str(exc)
-            logger.exception("  Part %d failed: %s", part.part_number, exc)
+            logger.exception("  Part %d failed (checkpoint saved — resume possible): %s",
+                             part.part_number, exc)
 
         return pr
+
+
+# ---------------------------------------------------------------------------
+# Merge multi-part redline outputs into single DOCX
+# ---------------------------------------------------------------------------
+
+def _merge_redline_parts(
+    part_results: list[PartResult],
+    output_path: Path,
+) -> Path:
+    """Merge multiple per-part redline DOCX files into one combined document.
+
+    Takes the first part as base, then appends all subsequent parts
+    with a page break between each. Tracked changes (w:del, w:ins)
+    are preserved from each part.
+    """
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    import copy
+
+    logger.info("Merging %d parts into single DOCX...", len(part_results))
+
+    # Use first part as base document
+    base_doc = DocxDocument(str(part_results[0].output_path))
+
+    for pr in part_results[1:]:
+        if not pr.output_path or not pr.output_path.exists():
+            continue
+
+        # Add page break before appending next part
+        pb_para = base_doc.add_paragraph()
+        run = pb_para.add_run()
+        br = OxmlElement("w:br")
+        br.set(qn("w:type"), "page")
+        run._element.append(br)
+
+        # Read the next part
+        part_doc = DocxDocument(str(pr.output_path))
+
+        # Copy all body elements (paragraphs, tables) from part into base
+        for element in part_doc.element.body:
+            tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
+            if tag in ("p", "tbl"):
+                base_doc.element.body.append(copy.deepcopy(element))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_doc.save(str(output_path))
+    logger.info("Merged DOCX saved: %s", output_path)
+    return output_path
